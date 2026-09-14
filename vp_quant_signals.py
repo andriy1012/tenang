@@ -6,9 +6,48 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 from typing import Optional, Dict
+import time
 
 st.set_page_config(page_title="Quant Volume Profile & Trading Plan", layout="wide")
 
+# ==========================================
+# FUNGSI FETCH DATA DENGAN RETRY & CACHE
+# ==========================================
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_yahoo_data(ticker: str, start_date: str, end_date: str, max_retries: int = 3) -> pd.DataFrame:
+    """
+    Mengambil data dari Yahoo Finance dengan mekanisme retry.
+    start_date dan end_date inklusif.
+    """
+    # Yahoo Finance end date bersifat eksklusif, jadi tambah 1 hari
+    end_dt = datetime.strptime(end_date, '%Y-%m-%d') + timedelta(days=1)
+    end_str = end_dt.strftime('%Y-%m-%d')
+    
+    last_exception = None
+    for attempt in range(max_retries):
+        try:
+            # Gunakan Ticker.history untuk kolom sederhana dan harga asli
+            df = yf.Ticker(ticker).history(
+                start=start_date,
+                end=end_str,
+                auto_adjust=False,   # harga asli (raw)
+                actions=False,       # tidak perlu dividen/split
+            )
+            if df.empty:
+                raise ValueError(f"Data kosong untuk {ticker} antara {start_date} dan {end_date}")
+            return df
+        except Exception as e:
+            last_exception = e
+            if attempt < max_retries - 1:
+                # Exponential backoff
+                time.sleep(2 ** attempt)
+            else:
+                raise last_exception
+    return pd.DataFrame()
+
+# ==========================================
+# KELAS ANALISIS
+# ==========================================
 class QuantTradingAnalyzer:
     """Modul Analisis Volume Profile dengan Trading Plan berbasis Jurnal Quant."""
     def __init__(self, ticker: str, start_date: str, end_date: str, bins: int = 150, va_pct: float = 0.70):
@@ -25,24 +64,36 @@ class QuantTradingAnalyzer:
 
     def fetch_and_calculate_indicators(self) -> None:
         """Mengambil data ekstra untuk indikator teknikal, lalu memotongnya sesuai rentang waktu."""
-        
-        # Tarik data ekstra (200 hari) ke belakang agar EMA 50 & ATR 14 akurat
         start_dt = datetime.strptime(self.start_date, '%Y-%m-%d')
         fetch_start = (start_dt - timedelta(days=200)).strftime('%Y-%m-%d')
         
-        df = yf.download(self.ticker, start=fetch_start, end=self.end_date, progress=False)
+        # Ambil data dengan fungsi retry
+        df = fetch_yahoo_data(self.ticker, fetch_start, self.end_date)
         if df.empty:
             raise ValueError(f"Data tidak ditemukan untuk {self.ticker}. Periksa kembali kode saham.")
         
+        # Normalisasi timezone jika ada
+        if df.index.tz is not None:
+            df.index = df.index.tz_localize(None)
+        
+        # Pastikan kolom sederhana (Ticker.history sudah sederhana, tapi jaga-jaga)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-            
+        
+        # Konversi ke numerik dan bersihkan
+        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df = df.dropna(subset=['Open', 'High', 'Low', 'Close', 'Volume'])
+        
+        if len(df) < 50:
+            raise ValueError("Data historis tidak cukup untuk menghitung EMA 50. Perluas rentang tanggal.")
+        
         df['Typical_Price'] = (df['High'] + df['Low'] + df['Close']) / 3
         
-        # 1. Menghitung EMA 50 (Trend Filter)
+        # 1. EMA 50 (Trend Filter)
         df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
         
-        # 2. Menghitung ATR 14 (Volatility untuk SL & TP)
+        # 2. ATR 14 (Volatility untuk SL & TP)
         high_low = df['High'] - df['Low']
         high_close = np.abs(df['High'] - df['Close'].shift())
         low_close = np.abs(df['Low'] - df['Close'].shift())
@@ -52,9 +103,10 @@ class QuantTradingAnalyzer:
         
         self.data_full = df.dropna()
         
-        # Slice data
-        mask = self.data_full.index.strftime('%Y-%m-%d') >= self.start_date
-        self.data = self.data_full.loc[mask].copy()
+        # Slice data menggunakan DatetimeIndex (inklusif)
+        start_ts = pd.Timestamp(self.start_date)
+        end_ts = pd.Timestamp(self.end_date)
+        self.data = self.data_full.loc[start_ts:end_ts].copy()
         
         if self.data.empty:
             raise ValueError("Rentang waktu kosong / hari libur bursa. Coba perluas tanggal.")
@@ -65,7 +117,6 @@ class QuantTradingAnalyzer:
         volumes = self.data['Volume'].values
 
         min_price, max_price = np.min(prices), np.max(prices)
-        # Handle edge case where max_price == min_price (Flat stock)
         if max_price == min_price:
             max_price += 1 
             min_price -= 1
@@ -121,8 +172,6 @@ class QuantTradingAnalyzer:
         
         if is_uptrend:
             trend_str = "📈 UPTREND (Banteng/Bullish) - Probabilitas Tinggi"
-            
-            # Universal Target Profit for Uptrend (Fixing the TP1 == TP2 issue)
             tp1 = vah
             tp2 = vah + (2 * atr)
             
@@ -134,7 +183,7 @@ class QuantTradingAnalyzer:
                 action = f"TUNGGU BREAKOUT. Harga jatuh di bawah Support (Rp {val:,.0f}). Tunggu harga memantul naik menembus Rp {val:,.0f} untuk amannya, atau Cicil Beli jika berani ambil risiko."
                 entry_min, entry_max = latest_close, val
                 sl = latest_close - (1.5 * atr)
-            else: # VAL <= latest_close <= POC
+            else:
                 action = "BELI SEKARANG (AKUMULASI). Harga sedang berada tepat di dalam Area Wajar Institusi!"
                 entry_min, entry_max = val, poc
                 sl = val - (1.5 * atr)
@@ -152,7 +201,7 @@ class QuantTradingAnalyzer:
                 entry_min, entry_max = latest_close, val
                 sl = latest_close - (1.2 * atr)
                 tp1 = poc
-                tp2 = vah + atr  # Prevent identical TP in downtrend too
+                tp2 = vah + atr
             else:
                 action = "WAIT & SEE. Saham sedang terjebak di tengah downtrend."
                 entry_min, entry_max = val, poc
@@ -160,7 +209,6 @@ class QuantTradingAnalyzer:
                 tp1 = vah
                 tp2 = vah + atr
                 
-        # Pengaman Terakhir: Pastikan TP2 selalu lebih besar secara fisik dari TP1
         if tp1 >= tp2:
             tp2 = tp1 + atr
             
@@ -272,6 +320,12 @@ if analyze_btn:
             analyzer.calculate_profile()
             analyzer.generate_trading_plan()
             plan = analyzer.plan
+            
+            # Cek kebaruan data
+            last_data_date = analyzer.data.index[-1].date()
+            today = datetime.today().date()
+            if (today - last_data_date).days > 5:
+                st.warning(f"⚠️ Data terakhir dari Yahoo Finance adalah {last_data_date}. Mungkin ada keterlambatan data.")
             
             st.subheader(f"📋 AI Trading Plan: {ticker}")
             
